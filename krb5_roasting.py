@@ -105,15 +105,19 @@ def parse_asreq_packets(pcap_file: str) -> List[Tuple[str, str, str, str]]:
 
 
 def parse_asrep_packets(pcap_file: str) -> List[Tuple[str, str, str, str, str]]:
-    # [修改说明] 仅针对此函数进行了逻辑修复，以正确识别 Etype 23
+    """
+    AS-REP 解析逻辑 (修改版)：
+    不再内部过滤非 23 类型，而是将所有解析到的 AS-REP (含 AES) 都返回。
+    由主函数决定如何处理(打印 Hash 或 打印跳过提示)。
+    """
     lines = smart_tshark_query(
         pcap_file,
         "kerberos.msg_type == 11 && kerberos.CNameString && kerberos.realm",
         fields_primary=[
             "kerberos.CNameString",
             "kerberos.realm",
-            "kerberos.encryptedKDCREPData_cipher",  # 这是用户部分，通常是 RC4
-            "kerberos.etype",  # 这里可能返回 "18,23"
+            "kerberos.encryptedKDCREPData_cipher",  # 依然锁定外层 EncPart
+            "kerberos.etype",
         ],
         fields_fallback=[
             "kerberos.CNameString",
@@ -130,29 +134,33 @@ def parse_asrep_packets(pcap_file: str) -> List[Tuple[str, str, str, str, str]]:
             if len(parts) < 3:
                 continue
             user, domain, cipher_blob = parts[0], parts[1], parts[2]
-            etype_str = parts[3] if len(parts) > 3 else "23"
+            etype_str = parts[3] if len(parts) > 3 else ""
 
-            # [关键修复开始] --------------------------------------------
-            # Tshark 返回的 etype 可能是 "18,23" (Ticket是AES, EncPart是RC4)
-            # 我们需要检查列表中是否存在 23，如果存在，强制使用 23，否则代码会默认取第一个(18)而跳过
+            # [逻辑变更] --------------------------------------------
+            # 1. 确定外层 Etype (取数组最后一个，对应 encryptedKDCREPData)
             etypes_list = etype_str.split(",")
-            if "23" in etypes_list:
-                etype = "23"
-            else:
-                etype = etypes_list[0]
-            # [关键修复结束] --------------------------------------------
+            etype = etypes_list[-1] if etypes_list else "23"
 
+            # 2. 【关键修改】这里不再判断 if etype != "23": continue
+            #    而是直接向下执行，把数据打包返回。
+            # -----------------------------------------------------
+
+            # 处理 Cipher 格式
             if "," in cipher_blob:
-                cipher_parts = cipher_blob.split(",")
-                target_cipher = clean_hex(cipher_parts[-1] if len(cipher_parts) > 1 else cipher_parts[0])
+                target_cipher = clean_hex(cipher_blob.split(",")[-1])
             else:
                 target_cipher = clean_hex(cipher_blob)
 
+            # 简单的切片逻辑以适应返回格式
+            # RC4 (23) 通常取前32字符(16字节)作为 Checksum
+            # AES (18) 虽然结构不同，但为了不报错，我们暂且按24字符切分，
+            # 反正主函数会打印 "Skip"，这里的具体切分精度对 AES 并不影响程序运行。
             checksum_len = 32 if etype == "23" else 24
 
             if len(target_cipher) > checksum_len:
                 checksum = target_cipher[:checksum_len]
                 enc_data = target_cipher[checksum_len:]
+                # 将 etype 一并返回，交给 main 函数去判断
                 results.append((user, domain, checksum, enc_data, etype))
         except Exception:
             continue
